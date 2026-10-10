@@ -2,21 +2,127 @@
 // シンプルなタスク管理CLI: add / due / priority / tag / untag / list / done
 const fs = require('fs');
 const path = require('path');
+const { DatabaseSync } = require('node:sqlite');
 
-const DATA_FILE = path.join(__dirname, 'tasks.json');
+const DB_FILE = path.join(__dirname, 'tasks.db');
+// 以前の保存先。tasks.db がまだ無いときに一度だけ読み込んで移行する (このファイルは変更しない)
+const LEGACY_JSON_FILE = path.join(__dirname, 'tasks.json');
 
-function loadTasks() {
-  if (!fs.existsSync(DATA_FILE)) return [];
+const SCHEMA = `
+  CREATE TABLE IF NOT EXISTS tasks (
+    id         INTEGER PRIMARY KEY,
+    title      TEXT    NOT NULL,
+    done       INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT    NOT NULL,
+    due        TEXT,
+    priority   TEXT CHECK (priority IN ('high', 'medium', 'low')),
+    done_at    TEXT
+  );
+  CREATE TABLE IF NOT EXISTS task_tags (
+    task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    name    TEXT    NOT NULL,
+    pos     INTEGER NOT NULL,
+    PRIMARY KEY (task_id, name)
+  );
+`;
+
+let db;
+
+// DB を開く (初回はテーブルを作り、tasks.json があれば移行する)
+function openDb() {
+  if (db) return db;
+  const isNew = !fs.existsSync(DB_FILE);
   try {
-    return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+    db = new DatabaseSync(DB_FILE);
+    db.exec('PRAGMA foreign_keys = ON;');
+    db.exec(SCHEMA);
   } catch (e) {
-    console.error(`エラー: ${DATA_FILE} の読み込みに失敗しました (${e.message})`);
+    console.error(`エラー: ${DB_FILE} を開けませんでした (${e.message})`);
     process.exit(1);
+  }
+  if (isNew && fs.existsSync(LEGACY_JSON_FILE)) migrateFromJson();
+  return db;
+}
+
+// 複数の書き込みをまとめて行う。途中で失敗したら何も書き込まない
+function inTransaction(fn) {
+  db.exec('BEGIN');
+  try {
+    fn();
+    db.exec('COMMIT');
+  } catch (e) {
+    db.exec('ROLLBACK');
+    throw e;
   }
 }
 
-function saveTasks(tasks) {
-  fs.writeFileSync(DATA_FILE, JSON.stringify(tasks, null, 2) + '\n', 'utf8');
+// tasks.json の中身を tasks.db に取り込む
+function migrateFromJson() {
+  let tasks;
+  try {
+    tasks = JSON.parse(fs.readFileSync(LEGACY_JSON_FILE, 'utf8'));
+  } catch (e) {
+    db.close();
+    fs.rmSync(DB_FILE, { force: true }); // 作りかけの DB を残さず、次回もう一度移行できるようにする
+    console.error(`エラー: ${LEGACY_JSON_FILE} の読み込みに失敗したため、移行できませんでした (${e.message})`);
+    process.exit(1);
+  }
+  inTransaction(() => tasks.forEach(writeTask));
+  console.log(`tasks.json から ${tasks.length} 件のタスクを tasks.db に移行しました (tasks.json はそのまま残しています)`);
+}
+
+// DB の行をタスクのオブジェクトにする (値の無い項目はキーごと省く)
+function rowToTask(row, tags) {
+  const task = { id: row.id, title: row.title, done: row.done === 1, createdAt: row.created_at };
+  if (row.due) task.due = row.due;
+  if (row.priority) task.priority = row.priority;
+  if (tags.length > 0) task.tags = tags;
+  if (row.done_at) task.doneAt = row.done_at;
+  return task;
+}
+
+// タスクごとのタグ一覧 (付けた順)
+function loadTagMap() {
+  const map = new Map();
+  for (const { task_id, name } of openDb().prepare('SELECT task_id, name FROM task_tags ORDER BY task_id, pos').all()) {
+    if (!map.has(task_id)) map.set(task_id, []);
+    map.get(task_id).push(name);
+  }
+  return map;
+}
+
+function loadTasks() {
+  const tagMap = loadTagMap();
+  return openDb().prepare('SELECT * FROM tasks ORDER BY id').all().map((row) => rowToTask(row, tagMap.get(row.id) || []));
+}
+
+// タスク1件を行として書き込む (同じ id があれば置き換える)。タグも付け直す
+function writeTask(task) {
+  db.prepare(`
+    INSERT INTO tasks (id, title, done, created_at, due, priority, done_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT (id) DO UPDATE SET
+      title = excluded.title, done = excluded.done, created_at = excluded.created_at,
+      due = excluded.due, priority = excluded.priority, done_at = excluded.done_at
+  `).run(task.id, task.title, task.done ? 1 : 0, task.createdAt, task.due ?? null, task.priority ?? null, task.doneAt ?? null);
+  db.prepare('DELETE FROM task_tags WHERE task_id = ?').run(task.id);
+  const insertTag = db.prepare('INSERT INTO task_tags (task_id, name, pos) VALUES (?, ?, ?)');
+  (task.tags || []).forEach((name, pos) => insertTag.run(task.id, name, pos));
+}
+
+// 変更したタスクを保存する
+function saveTask(task) {
+  openDb();
+  inTransaction(() => writeTask(task));
+}
+
+// 新しいタスクを追加し、番号を振って保存する (番号は 最大の番号 + 1)
+function insertTask(task) {
+  openDb();
+  inTransaction(() => {
+    task.id = db.prepare('SELECT COALESCE(MAX(id), 0) + 1 AS id FROM tasks').get().id;
+    writeTask(task);
+  });
 }
 
 // "YYYY-MM-DD" を検証して返す。不正なら終了する
@@ -131,15 +237,12 @@ function add(args) {
     console.error('エラー: タスク名を指定してください。例: node todo.js add "牛乳を買う" --due 2026-10-15 --priority 高 --tag 買い物');
     process.exit(1);
   }
-  const tasks = loadTasks();
-  const id = tasks.reduce((max, t) => Math.max(max, t.id), 0) + 1;
-  const task = { id, title, done: false, createdAt: new Date().toISOString() };
+  const task = { title, done: false, createdAt: new Date().toISOString() };
   if (due) task.due = due;
   if (priority) task.priority = priority;
   addTags(task, tags);
-  tasks.push(task);
-  saveTasks(tasks);
-  console.log(`追加しました: [${id}] ${formatPriority(task)}${title}${formatTags(task)}${formatDue(task)}`);
+  insertTask(task);
+  console.log(`追加しました: [${task.id}] ${formatPriority(task)}${title}${formatTags(task)}${formatDue(task)}`);
 }
 
 // タグ指定の引数 (1つ以上) をタグ名の配列にする
@@ -155,7 +258,7 @@ function tag(idArg, tagArgs) {
   const tasks = loadTasks();
   const task = findTask(tasks, idArg);
   addTags(task, parseTagArgs(tagArgs));
-  saveTasks(tasks);
+  saveTask(task);
   console.log(`タグを付けました: [${task.id}] ${task.title}${formatTags(task)}`);
 }
 
@@ -164,7 +267,7 @@ function untag(idArg, tagArgs) {
   const task = findTask(tasks, idArg);
   if (tagArgs.length === 1 && tagArgs[0] === 'all') delete task.tags;
   else removeTags(task, parseTagArgs(tagArgs));
-  saveTasks(tasks);
+  saveTask(task);
   console.log(`タグを外しました: [${task.id}] ${task.title}${formatTags(task)}`);
 }
 
@@ -173,12 +276,12 @@ function setPriority(idArg, priorityArg) {
   const task = findTask(tasks, idArg);
   if (priorityArg === 'none') {
     delete task.priority;
-    saveTasks(tasks);
+    saveTask(task);
     console.log(`優先度を解除しました: [${task.id}] ${task.title}`);
     return;
   }
   task.priority = parsePriority(priorityArg);
-  saveTasks(tasks);
+  saveTask(task);
   console.log(`優先度を設定しました: [${task.id}] ${formatPriority(task)}${task.title}`);
 }
 
@@ -187,12 +290,12 @@ function setDue(idArg, dateArg) {
   const task = findTask(tasks, idArg);
   if (dateArg === 'none') {
     delete task.due;
-    saveTasks(tasks);
+    saveTask(task);
     console.log(`期限を解除しました: [${task.id}] ${task.title}`);
     return;
   }
   task.due = parseDue(dateArg);
-  saveTasks(tasks);
+  saveTask(task);
   console.log(`期限を設定しました: [${task.id}] ${task.title}${formatDue(task)}`);
 }
 
@@ -255,7 +358,7 @@ function done(idArg) {
   }
   task.done = true;
   task.doneAt = new Date().toISOString();
-  saveTasks(tasks);
+  saveTask(task);
   console.log(`完了にしました: [${task.id}] ${task.title}`);
 }
 

@@ -1,2 +1,5 @@
 tasks.json
 node_modules/
+tasks.db
+tasks.db-journal
+tasks.backup.json

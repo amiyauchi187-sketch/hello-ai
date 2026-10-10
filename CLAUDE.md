@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-A zero-dependency Node.js task-management CLI. All code lives in `todo.js`; there is no `package.json`, build step, linter, or test suite. The README and all user-facing output (messages, errors, help text) are in Japanese. Keep new output and code comments in Japanese to match.
+A zero-dependency Node.js task-management CLI backed by the built-in SQLite module. All code lives in `todo.js`; there is no `package.json`, build step, linter, or test suite. The README and all user-facing output (messages, errors, help text) are in Japanese. Keep new output and code comments in Japanese to match.
 
 ## Running
 
@@ -23,12 +23,14 @@ There are no automated tests. Verify changes by running the commands above.
 
 ## Data file caution
 
-Tasks are stored in `tasks.json` next to `todo.js` (resolved via `__dirname`, not the cwd). The file is the user's personal data and is gitignored. Running the CLI to test a change writes to that real file, so back it up first (or restore it afterward) rather than adding junk tasks or overwriting it.
+Tasks are stored in the SQLite database `tasks.db` next to `todo.js` (resolved via `__dirname`, not the cwd). The legacy `tasks.json` in the same folder is the pre-SQLite data. Both are the user's personal data and are gitignored. Running the CLI to test a change writes to the real `tasks.db`, so test on a copy instead: copy `todo.js` (and a copy of `tasks.json` if you want to test migration) into a scratch directory and run it there.
 
 ## Architecture notes
 
-- **Flow:** each command is load → mutate → save. `loadTasks()` reads the whole JSON array and `saveTasks()` rewrites it. There is no locking or partial update.
-- **Task shape:** `{ id, title, done, createdAt, due?, priority?, doneAt? }`. `priority` is `high` / `medium` / `low` and is omitted when unset. `tags` is an array of names stored without the leading `#`, deduplicated, and omitted when empty. `due` is a normalized `YYYY-MM-DD` string and is omitted entirely when unset (`due ... none` deletes the key). `id` is `max(existing ids) + 1`, so ids are never reused unless the highest one is removed.
+- **Storage:** uses Node's built-in `node:sqlite` (`DatabaseSync`, needs Node 22.13+), so there are still no npm dependencies. Tables: `tasks` (snake_case columns, `done` as 0/1) and `task_tags` (`task_id`, `name`, `pos` for tag order). `openDb()` creates the schema lazily.
+- **Migration:** when `tasks.db` does not exist and `tasks.json` does, `openDb()` imports the JSON in one transaction. `tasks.json` is only read, never modified. If the JSON is unreadable, the half-created DB is removed so migration can be retried.
+- **Flow:** each command is load → mutate → save. `loadTasks()` reads every task into the same plain-object shape as before (`rowToTask()`), commands mutate one task, and `saveTask()` upserts that row and rewrites its tags inside a transaction. `insertTask()` assigns the id.
+- **Task shape:** `{ id, title, done, createdAt, due?, priority?, tags?, doneAt? }`. `priority` is `high` / `medium` / `low` and is omitted when unset. `tags` is an array of names stored without the leading `#`, deduplicated, and omitted when empty. `due` is a normalized `YYYY-MM-DD` string and is omitted entirely when unset (`due ... none` deletes the key). `id` is `max(existing ids) + 1`, so ids are never reused unless the highest one is removed.
 - **Dates:** `parseDue()` accepts `YYYY-M-D`, rejects impossible dates by round-tripping through `Date`, and zero-pads the result. Because of that padding, `list` can sort by plain string comparison. `daysUntil()` uses local-time midnight, so the "あと◯日 / 今日まで / ◯日超過" labels depend on the machine's timezone.
 - **Errors:** helpers such as `parseDue()` and `findTask()` print a Japanese error and call `process.exit(1)` directly instead of throwing.
 - **List order:** by priority (high → medium → low → none), then due date ascending with tasks without a due date last, then id.
