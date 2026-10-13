@@ -212,11 +212,21 @@ function formatTags(t) {
   return t.tags ? ' ' + t.tags.map((name) => `#${name}`).join(' ') : '';
 }
 
+// 未完了で期限を過ぎているか
+function isOverdue(t) {
+  return !t.done && Boolean(t.due) && daysUntil(t.due) < 0;
+}
+
+// 期限切れのタスクの行頭に付ける印
+function formatOverdueMark(t) {
+  return isOverdue(t) ? '⚠ ' : '';
+}
+
 function formatDue(t) {
   if (!t.due) return '';
   if (t.done) return ` (期限: ${t.due})`;
   const n = daysUntil(t.due);
-  const note = n < 0 ? `${-n}日超過` : n === 0 ? '今日まで' : `あと${n}日`;
+  const note = n < 0 ? `${-n}日超過` : n === 0 ? '今日' : `あと${n}日`;
   return ` (期限: ${t.due}, ${note})`;
 }
 
@@ -331,7 +341,7 @@ function list(args) {
   // 優先度順 (高→中→低→なし)、同じ優先度なら期限が近い順 (期限なしは最後)、さらに番号順
   shown.sort((a, b) => priorityRank(a) - priorityRank(b) || compareDue(a, b) || a.id - b.id);
   for (const t of shown) {
-    console.log(`${t.done ? '[x]' : '[ ]'} ${t.id}. ${formatPriority(t)}${t.title}${formatTags(t)}${formatDue(t)}`);
+    console.log(`${formatOverdueMark(t)}${t.done ? '[x]' : '[ ]'} ${t.id}. ${formatPriority(t)}${t.title}${formatTags(t)}${formatDue(t)}`);
   }
 }
 
