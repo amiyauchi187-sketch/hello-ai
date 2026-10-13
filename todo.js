@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// シンプルなタスク管理CLI: add / due / priority / tag / untag / list / done
+// シンプルなタスク管理CLI: add / due / priority / tag / untag / list / done / delete
 const fs = require('fs');
 const path = require('path');
 const { DatabaseSync } = require('node:sqlite');
@@ -123,6 +123,11 @@ function insertTask(task) {
     task.id = db.prepare('SELECT COALESCE(MAX(id), 0) + 1 AS id FROM tasks').get().id;
     writeTask(task);
   });
+}
+
+// タスク1件を削除する (タグは ON DELETE CASCADE で一緒に消える)
+function removeTask(task) {
+  openDb().prepare('DELETE FROM tasks WHERE id = ?').run(task.id);
 }
 
 // "YYYY-MM-DD" を検証して返す。不正なら終了する
@@ -372,6 +377,13 @@ function done(idArg) {
   console.log(`完了にしました: [${task.id}] ${task.title}`);
 }
 
+function deleteTask(idArg) {
+  const tasks = loadTasks();
+  const task = findTask(tasks, idArg);
+  removeTask(task);
+  console.log(`削除しました: [${task.id}] ${formatPriority(task)}${task.title}${formatTags(task)}`);
+}
+
 function help() {
   console.log(`使い方:
   node todo.js add <タスク名> [--due YYYY-MM-DD] [--priority 高|中|低] [--tag <タグ>]...
@@ -383,6 +395,7 @@ function help() {
   node todo.js list [--all] [--tag <タグ>]...    未完了タスクを優先度順・期限が近い順に一覧
                                                  (--all で完了済みも表示、--tag でタグを持つものに絞り込み)
   node todo.js done <番号>                       タスクを完了にする
+  node todo.js delete <番号>                     タスクを削除する (元に戻せません)
 
   タグは "#転職" のように # 付きでも指定できます (シェルのコメント扱いを避けるため引用符で囲んでください)`);
 }
@@ -411,6 +424,10 @@ switch (cmd) {
     break;
   case 'done':
     done(args[0]);
+    break;
+  case 'delete':
+  case 'rm':
+    deleteTask(args[0]);
     break;
   default:
     help();
